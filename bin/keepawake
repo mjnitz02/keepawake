@@ -1,0 +1,211 @@
+#!/bin/bash
+#
+# keepawake: control and monitor the keepawake daemon.
+#
+# The daemon runs as root; this CLI only writes a desired-state file that the
+# daemon polls, so day-to-day use needs no sudo.
+
+set -u
+
+STATE_DIR="/usr/local/var/keepawake"
+STATE_FILE="$STATE_DIR/state"
+STATUS_FILE="$STATE_DIR/status.json"
+LOG_FILE="/usr/local/var/log/keepawake.log"
+LABEL="local.keepawake"
+
+die() { printf 'keepawake: %s\n' "$*" >&2; exit 1; }
+
+# --- output helpers ----------------------------------------------------------
+
+if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_BLUE=$'\033[34m'
+else
+  C_RESET=''; C_DIM=''; C_BOLD=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_BLUE=''
+fi
+
+field() { printf '  %s%-10s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"; }
+
+# --- state -------------------------------------------------------------------
+
+require_installed() {
+  [ -w "$STATE_FILE" ] || \
+    die "state file not writable ($STATE_FILE). Is keepawake installed? Run: sudo ./install.sh"
+}
+
+json_get() {
+  [ -r "$STATUS_FILE" ] || return 1
+  /usr/bin/sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" \
+    "$STATUS_FILE" | /usr/bin/head -1
+}
+
+set_state() {
+  require_installed
+  printf '%s' "$1" >"$STATE_FILE" || die "could not write $STATE_FILE"
+  # Wait for the daemon to pick it up, so we report the real result rather than
+  # the state from before the switch.
+  i=0
+  while [ "$i" -lt 8 ]; do
+    sleep 1
+    [ "$(json_get desired 2>/dev/null)" = "$1" ] && return 0
+    i=$((i + 1))
+  done
+  return 0
+}
+
+daemon_pid() {
+  /bin/launchctl print "system/$LABEL" 2>/dev/null \
+    | /usr/bin/awk '/^[[:space:]]*pid = /{print $3; exit}'
+}
+
+kernel_flag() {
+  /usr/bin/pmset -g 2>/dev/null | /usr/bin/awk '/SleepDisabled/{print $2; exit}'
+}
+
+# --- status ------------------------------------------------------------------
+
+render_status() {
+  desired=$(json_get desired || echo unknown)
+  active=$(json_get active   || echo unknown)
+  reason=$(json_get reason   || echo unknown)
+  ac=$(json_get ac           || echo unknown)
+  batt=$(json_get battery    || echo '?')
+  upd=$(json_get updated_epoch || echo '')
+  flag=$(kernel_flag)
+  pid=$(daemon_pid)
+
+  # Headline. Treat a stale status file as not-active: a daemon that stopped
+  # writing must not leave a stale "ACTIVE" on screen.
+  now=$(/bin/date '+%s')
+  stale=0
+  case "$upd" in
+    ''|*[!0-9]*) stale=1 ;;
+    *) [ $((now - upd)) -gt 60 ] && stale=1 ;;
+  esac
+
+  if [ "$stale" = "1" ]; then
+    headline="${C_RED}● STALE${C_RESET}"
+    detail="daemon is not reporting"
+  elif [ "$active" = "true" ]; then
+    headline="${C_GREEN}${C_BOLD}● ACTIVE${C_RESET}"
+    detail="clamshell sleep is blocked"
+  elif [ "$desired" = "on" ]; then
+    headline="${C_YELLOW}${C_BOLD}● HELD OFF${C_RESET}"
+    detail="switched on, but a guard is overriding it"
+  else
+    headline="${C_DIM}○ OFF${C_RESET}"
+    detail="the Mac can sleep normally"
+  fi
+
+  printf '%sKeepAwake%s  %s   %s%s%s\n\n' \
+    "$C_BOLD" "$C_RESET" "$headline" "$C_DIM" "$detail" "$C_RESET"
+
+  field switch "$desired"
+
+  # A stale file's reason describes the past, not now, so do not present it as live.
+  [ "$stale" = "1" ] && reason="__stale__"
+
+  case "$reason" in
+    __stale__)   field guard "${C_RED}unknown (last report is stale)${C_RESET}" ;;
+    ok)          field guard "holding the flag" ;;
+    off)         field guard "${C_DIM}switched off${C_RESET}" ;;
+    no-ac)       field guard "${C_YELLOW}released: not on AC power${C_RESET}" ;;
+    battery-low) field guard "${C_YELLOW}released: battery below floor${C_RESET}" ;;
+    thermal)     field guard "${C_YELLOW}released: CPU thermally throttled${C_RESET}" ;;
+    stopped)     field guard "${C_RED}daemon stopped${C_RESET}" ;;
+    *)           field guard "$reason" ;;
+  esac
+
+  if [ "$ac" = "true" ]; then
+    field power "AC power ${C_DIM}·${C_RESET} ${batt}%"
+  else
+    field power "${C_YELLOW}on battery${C_RESET} ${C_DIM}·${C_RESET} ${batt}%"
+  fi
+
+  case "${flag:-}" in
+    1) field kernel "SleepDisabled=${C_GREEN}1${C_RESET}" ;;
+    0) field kernel "SleepDisabled=0" ;;
+    *) field kernel "SleepDisabled=? ${C_DIM}(could not read pmset)${C_RESET}" ;;
+  esac
+
+  if [ -n "$pid" ]; then
+    field daemon "loaded ${C_DIM}(pid $pid)${C_RESET}"
+  else
+    field daemon "${C_RED}not loaded${C_RESET} ${C_DIM}run: sudo launchctl bootstrap system /Library/LaunchDaemons/$LABEL.plist${C_RESET}"
+  fi
+
+  if [ "$stale" = "0" ]; then
+    field updated "$((now - upd))s ago"
+  else
+    field updated "${C_RED}never or >60s ago${C_RESET}"
+  fi
+
+  if [ -r "$LOG_FILE" ]; then
+    printf '\n  %srecent%s\n' "$C_DIM" "$C_RESET"
+    /usr/bin/tail -6 "$LOG_FILE" | /usr/bin/sed "s/^/    ${C_DIM}/;s/$/${C_RESET}/"
+  fi
+}
+
+cmd_watch() {
+  # Restore the cursor if the user hits Ctrl-C mid-redraw.
+  trap 'printf "\033[?25h\n"; exit 0' INT TERM
+  printf '\033[?25l'
+  while :; do
+    out=$(render_status)
+    printf '\033[H\033[2J%s\n\n  %spress Ctrl-C to stop%s\n' \
+      "$out" "$C_DIM" "$C_RESET"
+    sleep 2
+  done
+}
+
+# --- commands ----------------------------------------------------------------
+
+case "${1:-status}" in
+  on)
+    set_state on
+    reason=$(json_get reason || echo unknown)
+    if [ "$reason" = "ok" ]; then
+      printf '%skeepawake: ON%s, clamshell sleep blocked while on AC power\n' "$C_GREEN" "$C_RESET"
+    else
+      printf '%skeepawake: switched ON, but not holding (guard: %s)%s\n' "$C_YELLOW" "$reason" "$C_RESET"
+      printf 'Run `keepawake status` for detail.\n'
+    fi
+    ;;
+  off)
+    set_state off
+    printf 'keepawake: OFF, normal sleep restored\n'
+    ;;
+  toggle)
+    cur=$(json_get desired || echo off)
+    if [ "$cur" = "on" ]; then exec "$0" off; else exec "$0" on; fi
+    ;;
+  status) render_status ;;
+  watch)  cmd_watch ;;
+  log)    exec /usr/bin/tail -f "$LOG_FILE" ;;
+  why)
+    # What did the Mac actually sleep for? The reason string is the fastest way
+    # to tell clamshell sleep apart from idle sleep or a maintenance wake cycle.
+    printf '%srecent sleep events (newest last)%s\n' "$C_BOLD" "$C_RESET"
+    /usr/bin/pmset -g log 2>/dev/null \
+      | /usr/bin/grep -E "Entering (Sleep|DarkWake) state" \
+      | /usr/bin/tail -15 | /usr/bin/sed 's/^/  /'
+    ;;
+  -h|--help|help)
+    /bin/cat <<'EOF'
+usage: keepawake <command>
+
+  on       block clamshell sleep (while on AC power)
+  off      restore normal sleep behavior
+  toggle   flip the switch
+  status   one-shot state: switch, guards, kernel flag, daemon, recent log
+  watch    same view, live-refreshing every 2s
+  why      recent sleep reasons straight from the macOS power log
+  log      follow the daemon log
+
+The daemon releases the block automatically when AC power is disconnected,
+when the battery falls below the floor, or when the CPU is thermally
+throttled. Unplugging is always enough to make the Mac sleepable again.
+EOF
+    ;;
+  *) die "unknown command '$1' (try --help)" ;;
+esac

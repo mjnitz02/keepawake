@@ -1,0 +1,206 @@
+#!/bin/bash
+#
+# keepawake-daemon
+#
+# Runs as root under launchd. Its only job is to keep the kernel's
+# "SleepDisabled" flag in the state we want, and to put it back whenever
+# something else (Jamf, a macOS update, a user running pmset) changes it.
+#
+# Why SleepDisabled and not caffeinate:
+#   caffeinate creates an IOKit power assertion. Assertions block *idle*
+#   sleep only. They do not block 'Clamshell Sleep', which is what fires
+#   when the lid is shut and macOS decides the external display went away.
+#   SleepDisabled is the one supported knob that suppresses that path.
+#
+# Safety: we only hold the flag while the machine is on AC power, above a
+# battery floor, and not thermally throttled. Unplugging the power cable is
+# therefore enough to make the Mac sleepable again, which covers the
+# "threw it in a bag without turning this off" case.
+
+set -u
+
+STATE_DIR="/usr/local/var/keepawake"
+STATE_FILE="$STATE_DIR/state"
+STATUS_FILE="$STATE_DIR/status.json"
+CONF_FILE="$STATE_DIR/config"
+LOG_FILE="/usr/local/var/log/keepawake.log"
+
+# Defaults, overridable from $CONF_FILE.
+INTERVAL=2          # seconds between checks
+BATT_FLOOR=30       # let the Mac sleep if battery drops below this, even on AC
+THERM_FLOOR=50      # let the Mac sleep if CPU speed limit falls below this %
+LOG_MAX_BYTES=1048576
+
+# shellcheck source=/dev/null
+[ -r "$CONF_FILE" ] && . "$CONF_FILE"
+
+PMSET=/usr/bin/pmset
+
+log() {
+  if [ -f "$LOG_FILE" ]; then
+    size=$(/usr/bin/stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$LOG_MAX_BYTES" ]; then
+      /bin/mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null
+    fi
+  fi
+  printf '%s  %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"
+}
+
+# --- readers -----------------------------------------------------------------
+
+# Sets AC=0|1 and BATT=<percent>.
+read_power() {
+  out=$($PMSET -g batt 2>/dev/null)
+  case "$out" in
+    *"'AC Power'"*) AC=1 ;;
+    *)              AC=0 ;;
+  esac
+  BATT=$(printf '%s' "$out" | /usr/bin/sed -n 's/.*[^0-9]\([0-9][0-9]*\)%.*/\1/p' | /usr/bin/head -1)
+  # No battery, or unparseable output: don't let that trip the floor guard.
+  case "$BATT" in
+    ''|*[!0-9]*) BATT=100 ;;
+  esac
+}
+
+# Current kernel flag: 0 or 1.
+read_sleep_disabled() {
+  $PMSET -g 2>/dev/null | /usr/bin/awk '/SleepDisabled/{print $2; exit}'
+}
+
+# True when the lid is shut. Costs about 20ms.
+lid_closed() {
+  /usr/sbin/ioreg -r -k AppleClamshellState -d 4 2>/dev/null \
+    | /usr/bin/grep -m1 '"AppleClamshellState"' \
+    | /usr/bin/grep -q Yes
+}
+
+# pmset only reports a speed limit once the machine has actually throttled,
+# so "nothing recorded" is the healthy case. Fail open on anything odd.
+thermal_ok() {
+  lim=$($PMSET -g therm 2>/dev/null | /usr/bin/awk -F'= *' '/CPU_Speed_Limit/{print $2; exit}')
+  case "$lim" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  [ "$lim" -ge "$THERM_FLOOR" ]
+}
+
+read_desired() {
+  if [ -r "$STATE_FILE" ]; then
+    /usr/bin/head -c 16 "$STATE_FILE" 2>/dev/null | /usr/bin/tr -d '[:space:]'
+  else
+    printf 'off'
+  fi
+}
+
+# --- writers -----------------------------------------------------------------
+
+apply() {
+  want=$1
+  $PMSET -a disablesleep "$want" >/dev/null 2>&1
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    log "ERROR pmset -a disablesleep $want failed (rc=$rc)"
+  fi
+  return $rc
+}
+
+write_status() {
+  local active reason sdflag
+  active=$1; reason=$2; sdflag=${3:-0}
+  /bin/cat >"$STATUS_FILE.tmp" <<EOF
+{
+  "desired": "$DESIRED",
+  "active": $active,
+  "reason": "$reason",
+  "ac": $( [ "$AC" = 1 ] && echo true || echo false ),
+  "battery": $BATT,
+  "sleep_disabled": $sdflag,
+  "updated": "$(/bin/date '+%Y-%m-%d %H:%M:%S')",
+  "updated_epoch": $(/bin/date '+%s')
+}
+EOF
+  /bin/mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
+  /bin/chmod 644 "$STATUS_FILE" 2>/dev/null
+}
+
+# --- lifecycle ---------------------------------------------------------------
+
+# Always hand sleep back to macOS when we stop, however we stop.
+cleanup() {
+  trap - EXIT INT TERM
+  apply 0
+  log "daemon stopping; sleep re-enabled"
+  AC=${AC:-0}; BATT=${BATT:-100}; DESIRED=${DESIRED:-off}
+  write_status false "stopped" 0
+  exit 0
+}
+trap cleanup EXIT INT TERM
+
+/bin/mkdir -p "$STATE_DIR" "$(/usr/bin/dirname "$LOG_FILE")"
+[ -f "$STATE_FILE" ] || printf 'off' >"$STATE_FILE"
+
+log "daemon started (interval=${INTERVAL}s batt_floor=${BATT_FLOOR}% therm_floor=${THERM_FLOOR}%)"
+
+last_reason=""
+last_flag=""
+prev_ac=""
+
+while :; do
+  DESIRED=$(read_desired)
+  read_power
+
+  reason="ok"
+  want=1
+  if [ "$DESIRED" != "on" ]; then
+    reason="off"; want=0
+  elif [ "$AC" != "1" ]; then
+    reason="no-ac"; want=0
+  elif [ "$BATT" -lt "$BATT_FLOOR" ]; then
+    reason="battery-low"; want=0
+  elif ! thermal_ok; then
+    reason="thermal"; want=0
+  fi
+
+  flag=$(read_sleep_disabled)
+  case "$flag" in
+    ''|*[!0-9]*) flag=0 ;;
+  esac
+
+  if [ "$flag" != "$want" ]; then
+    # A mismatch while we still want the flag held is the interesting case:
+    # something external reset it. Log it so there's a record of the sweep.
+    if [ "$want" = "1" ] && [ "$last_flag" = "1" ]; then
+      log "SleepDisabled was reset to $flag by something else; re-applying 1"
+    else
+      log "setting SleepDisabled=$want (reason=$reason ac=$AC batt=${BATT}%)"
+    fi
+    apply "$want"
+    flag=$(read_sleep_disabled)
+    case "$flag" in
+      ''|*[!0-9]*) flag=0 ;;
+    esac
+  elif [ "$reason" != "$last_reason" ]; then
+    log "state: desired=$DESIRED reason=$reason ac=$AC batt=${BATT}% flag=$flag"
+  fi
+
+  # Unplugging while the lid is already shut is the "packing up" gesture.
+  # Releasing the flag is not enough on its own: the lid-close event that would
+  # have slept the machine already fired while we were still holding the flag,
+  # and with `sleep 0` configured on battery nothing comes along to retry it.
+  # So on that specific transition, ask for sleep explicitly, once.
+  if [ "$prev_ac" = "1" ] && [ "$AC" = "0" ] && [ "$want" = "0" ] && lid_closed; then
+    log "AC lost with the lid closed; requesting sleep"
+    $PMSET sleepnow >/dev/null 2>&1
+  fi
+
+  if [ "$want" = "1" ] && [ "$flag" = "1" ]; then
+    write_status true "$reason" "$flag"
+  else
+    write_status false "$reason" "$flag"
+  fi
+
+  last_reason="$reason"
+  last_flag="$flag"
+  prev_ac="$AC"
+  /bin/sleep "$INTERVAL"
+done
