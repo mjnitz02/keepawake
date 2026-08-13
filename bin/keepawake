@@ -7,11 +7,26 @@
 
 set -u
 
-STATE_DIR="/usr/local/var/keepawake"
+# Paths are overridable only so the test suite can point them at a scratch
+# directory. Normal use never sets these.
+STATE_DIR="${KEEPAWAKE_STATE_DIR:-/usr/local/var/keepawake}"
 STATE_FILE="$STATE_DIR/state"
+NUDGE_FILE="$STATE_DIR/nudge"
 STATUS_FILE="$STATE_DIR/status.json"
-LOG_FILE="/usr/local/var/log/keepawake.log"
+CONF_FILE="$STATE_DIR/config"
+LOG_FILE="${KEEPAWAKE_LOG_FILE:-/usr/local/var/log/keepawake.log}"
 LABEL="local.keepawake"
+NUDGE_LABEL="local.keepawake.nudge"
+HELPER="/usr/local/libexec/keepawake-nudge"
+AGENT_FILE="$HOME/Library/Application Support/keepawake/agent.json"
+NUDGE_LOG="$HOME/Library/Logs/keepawake-nudge.log"
+
+# How long `keepawake nudge on` runs when no duration is given. Bounded on
+# purpose: the whole point is an evening of cover, not a mode you discover is
+# still running next Tuesday.
+NUDGE_DEFAULT_DURATION=8h
+# shellcheck source=/dev/null
+[ -r "$CONF_FILE" ] && . "$CONF_FILE" 2>/dev/null
 
 die() { printf 'keepawake: %s\n' "$*" >&2; exit 1; }
 
@@ -19,9 +34,9 @@ die() { printf 'keepawake: %s\n' "$*" >&2; exit 1; }
 
 if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
   C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
-  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_BLUE=$'\033[34m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
 else
-  C_RESET=''; C_DIM=''; C_BOLD=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_BLUE=''
+  C_RESET=''; C_DIM=''; C_BOLD=''; C_GREEN=''; C_YELLOW=''; C_RED=''
 fi
 
 field() { printf '  %s%-10s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"; }
@@ -33,10 +48,52 @@ require_installed() {
     die "state file not writable ($STATE_FILE). Is keepawake installed? Run: sudo ./install.sh"
 }
 
+# The value class cannot exclude spaces (timestamps contain one), so a value
+# sitting before a closing brace picks up trailing whitespace. Left alone that
+# turns a perfectly good number into something the [0-9] guards reject, and the
+# symptom is a healthy agent reported as "not running". Trim on the way out.
+json_scan() {
+  /usr/bin/sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" \
+    "$2" | /usr/bin/head -1 | /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
 json_get() {
   [ -r "$STATUS_FILE" ] || return 1
-  /usr/bin/sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" \
-    "$STATUS_FILE" | /usr/bin/head -1
+  json_scan "$1" "$STATUS_FILE"
+}
+
+# The agent reports from inside the GUI session, which is the only place that
+# can answer "is Accessibility actually granted" truthfully. Asking the helper
+# from here would describe this terminal's TCC identity, not the agent's.
+agent_get() {
+  [ -r "$AGENT_FILE" ] || return 1
+  json_scan "$1" "$AGENT_FILE"
+}
+
+# Seconds -> "5h58m" / "12m" / "45s". Used for both countdowns and elapsed time.
+human_dur() {
+  s=$1
+  [ "$s" -lt 0 ] && s=0
+  if   [ "$s" -ge 3600 ]; then printf '%dh%dm' "$((s / 3600))" "$(((s % 3600) / 60))"
+  elif [ "$s" -ge 60 ];   then printf '%dm' "$((s / 60))"
+  else                         printf '%ds' "$s"
+  fi
+}
+
+# Accepts 30s / 45m / 6h / a bare number of minutes / forever. Prints seconds,
+# where 0 means no expiry.
+parse_duration() {
+  case "$1" in
+    forever|none|indefinite) printf '0'; return 0 ;;
+    *[0-9]s) n=${1%s}; mult=1 ;;
+    *[0-9]m) n=${1%m}; mult=60 ;;
+    *[0-9]h) n=${1%h}; mult=3600 ;;
+    *[0-9])  n=$1;     mult=60 ;;
+    *) return 1 ;;
+  esac
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$n" -eq 0 ] && return 1
+  printf '%s' "$((n * mult))"
 }
 
 set_state() {
@@ -63,6 +120,79 @@ kernel_flag() {
 }
 
 # --- status ------------------------------------------------------------------
+
+# The nudge block is deliberately two lines when it matters: the switch and the
+# guards live in the daemon, but whether a nudge can actually land lives in the
+# agent's Accessibility grant. Showing only one of those hides the failure that
+# actually bites, which is a switch reading "on" while every nudge silently
+# does nothing.
+render_nudge() {
+  now=$1
+  n_desired=$(json_get nudge_desired || echo off)
+  n_reason=$(json_get nudge_reason   || echo off)
+  n_expires=$(json_get nudge_expires_epoch || echo 0)
+  off_reason=$(json_get nudge_off_reason || echo '')
+  off_epoch=$(json_get nudge_off_epoch   || echo 0)
+
+  a_upd=$(agent_get updated_epoch || echo '')
+  a_trusted=$(agent_get trusted || echo '')
+  a_idle=$(agent_get idle || echo '')
+  a_last=$(agent_get last_nudge_epoch || echo 0)
+  a_count=$(agent_get nudges || echo 0)
+
+  case "$a_upd" in
+    ''|*[!0-9]*) agent_live=0 ;;
+    *) [ $((now - a_upd)) -le 30 ] && agent_live=1 || agent_live=0 ;;
+  esac
+
+  # Idle time and nudge counts come from the agent's last report. If the agent
+  # has stopped reporting they describe the past, so drop them rather than
+  # render a dead agent as a busy one.
+  if [ "$agent_live" != "1" ]; then a_idle=""; a_last=0; fi
+
+  if [ "$n_reason" = "ok" ]; then
+    line="${C_GREEN}on${C_RESET}"
+    case "$a_idle" in
+      ''|*[!0-9]*) : ;;
+      *) line="$line ${C_DIM}·${C_RESET} idle $(human_dur "$a_idle")" ;;
+    esac
+    case "$a_last" in
+      ''|0|*[!0-9]*) [ "$agent_live" = "1" ] && line="$line ${C_DIM}·${C_RESET} ${C_DIM}no nudge yet${C_RESET}" ;;
+      *) line="$line ${C_DIM}·${C_RESET} nudged $(human_dur $((now - a_last))) ago ${C_DIM}(${a_count})${C_RESET}" ;;
+    esac
+    case "$n_expires" in
+      ''|0|*[!0-9]*) line="$line ${C_DIM}·${C_RESET} ${C_DIM}no expiry${C_RESET}" ;;
+      *) line="$line ${C_DIM}·${C_RESET} $(human_dur $((n_expires - now))) left" ;;
+    esac
+    field nudge "$line"
+  elif [ "$n_desired" = "on" ]; then
+    field nudge "${C_YELLOW}on, but the daemon is not running it (${n_reason})${C_RESET}"
+  else
+    line="${C_DIM}off${C_RESET}"
+    case "$off_reason" in
+      ''|0) ;;
+      *)
+        case "$off_epoch" in
+          ''|0|*[!0-9]*) line="$line ${C_DIM}(auto-off: $off_reason)${C_RESET}" ;;
+          *) line="$line ${C_DIM}(auto-off: $off_reason, $(human_dur $((now - off_epoch))) ago)${C_RESET}" ;;
+        esac
+        ;;
+    esac
+    field nudge "$line"
+  fi
+
+  # Only worth a line when nudge is switched on. A stopped agent is irrelevant
+  # noise the rest of the time.
+  if [ "$n_desired" = "on" ]; then
+    if [ "$agent_live" != "1" ]; then
+      field agent "${C_RED}not running${C_RESET} ${C_DIM}run: launchctl kickstart -k gui/$(/usr/bin/id -u)/$NUDGE_LABEL${C_RESET}"
+    elif [ "$a_trusted" = "true" ]; then
+      field agent "running ${C_DIM}·${C_RESET} Accessibility ${C_GREEN}granted${C_RESET}"
+    else
+      field agent "${C_RED}Accessibility not granted${C_RESET} ${C_DIM}· nudges will silently do nothing · keepawake nudge grant${C_RESET}"
+    fi
+  fi
+}
 
 render_status() {
   desired=$(json_get desired || echo unknown)
@@ -128,6 +258,8 @@ render_status() {
     *) field kernel "SleepDisabled=? ${C_DIM}(could not read pmset)${C_RESET}" ;;
   esac
 
+  render_nudge "$now"
+
   if [ -n "$pid" ]; then
     field daemon "loaded ${C_DIM}(pid $pid)${C_RESET}"
   else
@@ -146,6 +278,118 @@ render_status() {
   fi
 }
 
+# --- nudge -------------------------------------------------------------------
+
+set_nudge() {
+  [ -w "$NUDGE_FILE" ] || \
+    die "nudge state file not writable ($NUDGE_FILE). Re-run: sudo ./install.sh"
+  printf '%s' "$1" >"$NUDGE_FILE" || die "could not write $NUDGE_FILE"
+  want=${1%% *}
+  i=0
+  while [ "$i" -lt 8 ]; do
+    sleep 1
+    [ "$(json_get nudge_desired 2>/dev/null)" = "$want" ] && return 0
+    i=$((i + 1))
+  done
+  return 0
+}
+
+nudge_permission_warning() {
+  now=$(/bin/date '+%s')
+  a_upd=$(agent_get updated_epoch || echo '')
+  a_trusted=$(agent_get trusted || echo '')
+
+  case "$a_upd" in
+    ''|*[!0-9]*) live=0 ;;
+    *) [ $((now - a_upd)) -le 30 ] && live=1 || live=0 ;;
+  esac
+
+  if [ "$live" != "1" ]; then
+    printf '\n%sThe nudge agent is not running%s, so nothing will move the cursor.\n' \
+      "$C_YELLOW" "$C_RESET"
+    printf '  launchctl kickstart -k gui/%s/%s\n' "$(/usr/bin/id -u)" "$NUDGE_LABEL"
+    return
+  fi
+
+  # This is the failure mode worth being loud about. Without the grant,
+  # CGEventPost returns success and does nothing at all, so the switch reads
+  # "on" for hours while the screen saver starts right on schedule.
+  if [ "$a_trusted" != "true" ]; then
+    printf '\n%sAccessibility is not granted%s, so every nudge will silently do nothing.\n' \
+      "$C_YELLOW" "$C_RESET"
+    printf '  System Settings > Privacy & Security > Accessibility > +\n'
+    printf '  then Cmd+Shift+G and paste:  %s\n' "$HELPER"
+    printf '  or run: keepawake nudge grant\n'
+  fi
+}
+
+cmd_nudge() {
+  case "${1:-status}" in
+    on)
+      if [ -n "${2:-}" ]; then
+        secs=$(parse_duration "$2") || \
+          die "could not read duration '$2' (try 30m, 6h, 90, or forever)"
+      else
+        secs=$(parse_duration "$NUDGE_DEFAULT_DURATION") || secs=28800
+      fi
+
+      if [ "$secs" -eq 0 ]; then
+        set_nudge "on 0"
+        expiry_note="no expiry, off on unplug or 'keepawake nudge off'"
+      else
+        expiry=$(( $(/bin/date '+%s') + secs ))
+        set_nudge "on $expiry"
+        expiry_note="auto-off in $(human_dur "$secs")"
+      fi
+
+      reason=$(json_get nudge_reason || echo unknown)
+      if [ "$reason" = "ok" ]; then
+        printf '%skeepawake: nudge ON%s, %s\n' "$C_GREEN" "$C_RESET" "$expiry_note"
+        printf '%sThe cursor moves 1px and back once the Mac has been idle a while,\n' "$C_DIM"
+        printf 'which keeps the screen saver from starting.%s\n' "$C_RESET"
+      else
+        printf '%skeepawake: nudge switched ON, but not running (guard: %s)%s\n' \
+          "$C_YELLOW" "$reason" "$C_RESET"
+      fi
+
+      nudge_permission_warning
+
+      # Nudging stops the screen saver. It does nothing about clamshell sleep,
+      # which is a separate mechanism and the reason this tool exists. Anyone
+      # turning nudge on for a remote session almost certainly wants both.
+      if [ "$(json_get desired || echo off)" != "on" ]; then
+        printf '\n%sNote: the sleep block is off.%s Nudging stops the screen saver but not\n' \
+          "$C_YELLOW" "$C_RESET"
+        printf 'clamshell sleep. For an unattended remote session run: keepawake on\n'
+      fi
+      ;;
+    off)
+      set_nudge off
+      printf 'keepawake: nudge OFF\n'
+      ;;
+    grant)
+      printf 'Opening Accessibility settings. Add this binary with "+":\n\n  %s\n\n' "$HELPER"
+      printf '%sIn the file picker press Cmd+Shift+G and paste the path.%s\n' "$C_DIM" "$C_RESET"
+      /usr/bin/open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" \
+        2>/dev/null || printf 'Could not open System Settings; navigate there manually.\n'
+      ;;
+    log)
+      [ -r "$NUDGE_LOG" ] || die "no nudge agent log yet at $NUDGE_LOG"
+      exec /usr/bin/tail -f "$NUDGE_LOG"
+      ;;
+    status)
+      now=$(/bin/date '+%s')
+      printf '%sKeepAwake nudge%s\n\n' "$C_BOLD" "$C_RESET"
+      render_nudge "$now"
+      if [ -r "$NUDGE_LOG" ]; then
+        printf '\n  %srecent%s\n' "$C_DIM" "$C_RESET"
+        /usr/bin/tail -6 "$NUDGE_LOG" | /usr/bin/sed "s/^/    ${C_DIM}/;s/$/${C_RESET}/"
+      fi
+      ;;
+    *) die "unknown nudge command '$1' (try: on, off, status, grant, log)" ;;
+  esac
+}
+
 cmd_watch() {
   # Restore the cursor if the user hits Ctrl-C mid-redraw.
   trap 'printf "\033[?25h\n"; exit 0' INT TERM
@@ -159,6 +403,10 @@ cmd_watch() {
 }
 
 # --- commands ----------------------------------------------------------------
+
+# Sourcing this file defines the helpers above without running a command.
+# The test suite relies on this; nothing else sets it.
+[ "${KEEPAWAKE_LIB_ONLY:-0}" = "1" ] && return 0
 
 case "${1:-status}" in
   on)
@@ -179,6 +427,7 @@ case "${1:-status}" in
     cur=$(json_get desired || echo off)
     if [ "$cur" = "on" ]; then exec "$0" off; else exec "$0" on; fi
     ;;
+  nudge)  shift; cmd_nudge "$@" ;;
   status) render_status ;;
   watch)  cmd_watch ;;
   log)    exec /usr/bin/tail -f "$LOG_FILE" ;;
@@ -202,9 +451,26 @@ usage: keepawake <command>
   why      recent sleep reasons straight from the macOS power log
   log      follow the daemon log
 
+  nudge on [DURATION]   also keep the screen saver away (default 8h)
+  nudge off             stop nudging
+  nudge status          nudge switch, idle time, agent, Accessibility
+  nudge grant           open Accessibility settings to authorize the helper
+  nudge log             follow the nudge agent log
+
 The daemon releases the block automatically when AC power is disconnected,
 when the battery falls below the floor, or when the CPU is thermally
 throttled. Unplugging is always enough to make the Mac sleepable again.
+
+The two switches solve different problems and are independent:
+
+  on       stops the machine sleeping (clamshell sleep, idle sleep)
+  nudge    stops the screen saver, by moving the cursor 1px once the Mac
+           has been idle a while
+
+An unattended remote session usually wants both. Nudge never turns itself on,
+and any guard that fires switches it off for good rather than holding it back,
+so plugging back in does not restart it. DURATION accepts 30m, 6h, a bare
+number of minutes, or 'forever'.
 EOF
     ;;
   *) die "unknown command '$1' (try --help)" ;;

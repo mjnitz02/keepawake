@@ -19,11 +19,16 @@
 
 set -u
 
-STATE_DIR="/usr/local/var/keepawake"
+# Paths are overridable only so the test suite can point them at a scratch
+# directory. launchd controls this daemon's environment, so nothing sets these
+# in the real install.
+STATE_DIR="${KEEPAWAKE_STATE_DIR:-/usr/local/var/keepawake}"
 STATE_FILE="$STATE_DIR/state"
+NUDGE_FILE="$STATE_DIR/nudge"
+NUDGE_LAST_FILE="$STATE_DIR/nudge.last"
 STATUS_FILE="$STATE_DIR/status.json"
 CONF_FILE="$STATE_DIR/config"
-LOG_FILE="/usr/local/var/log/keepawake.log"
+LOG_FILE="${KEEPAWAKE_LOG_FILE:-/usr/local/var/log/keepawake.log}"
 
 # Defaults, overridable from $CONF_FILE.
 INTERVAL=2          # seconds between checks
@@ -84,12 +89,73 @@ thermal_ok() {
   [ "$lim" -ge "$THERM_FLOOR" ]
 }
 
+# Two guard chains now ask the same thermal question each pass. Memoize it so
+# that costs one pmset call per loop instead of two, and still costs nothing at
+# all on the common path where an earlier guard already decided the answer.
+THERM_CACHE=""
+thermal_ok_cached() {
+  if [ -z "$THERM_CACHE" ]; then
+    if thermal_ok; then THERM_CACHE=1; else THERM_CACHE=0; fi
+  fi
+  [ "$THERM_CACHE" = "1" ]
+}
+
 read_desired() {
   if [ -r "$STATE_FILE" ]; then
     /usr/bin/head -c 16 "$STATE_FILE" 2>/dev/null | /usr/bin/tr -d '[:space:]'
   else
     printf 'off'
   fi
+}
+
+# Sets NUDGE_DESIRED (on|off) and NUDGE_EXPIRES (epoch, or 0 for no expiry).
+# File format is one line: "off", "on 0", or "on <expiry-epoch>".
+read_nudge() {
+  NUDGE_DESIRED=off
+  NUDGE_EXPIRES=0
+  [ -r "$NUDGE_FILE" ] || return 0
+  line=$(/usr/bin/head -c 64 "$NUDGE_FILE" 2>/dev/null | /usr/bin/tr -d '\n')
+  word=${line%% *}
+  [ "$word" = "on" ] || return 0
+  NUDGE_DESIRED=on
+  rest=${line#"$word"}
+  rest=${rest# }
+  rest=${rest%% *}
+  case "$rest" in
+    ''|*[!0-9]*) NUDGE_EXPIRES=0 ;;
+    *)           NUDGE_EXPIRES=$rest ;;
+  esac
+}
+
+# Nudge mode latches OFF rather than being held off, which is the one place it
+# deliberately differs from the sleep block. The sleep block resumes by itself
+# when you plug back in, because that is a standing preference. Nudging is a
+# thing you switched on for one evening, so a machine that starts moving its own
+# cursor again just because it found a power outlet is wrong. Unplugging ends
+# the session, full stop, and turning it back on is a deliberate act.
+nudge_latch_off() {
+  printf 'off' >"$NUDGE_FILE" 2>/dev/null
+  printf '%s %s' "$1" "$(/bin/date '+%s')" >"$NUDGE_LAST_FILE" 2>/dev/null
+  /bin/chmod 644 "$NUDGE_LAST_FILE" 2>/dev/null
+  log "nudge switched OFF automatically (reason=$1 ac=$AC batt=${BATT}%)"
+  NUDGE_DESIRED=off
+  NUDGE_EXPIRES=0
+}
+
+# What turned nudge off last, so `keepawake status` can say why rather than
+# just showing a switch the user did not flip.
+read_nudge_last() {
+  NUDGE_OFF_REASON=""
+  NUDGE_OFF_EPOCH=0
+  [ -r "$NUDGE_LAST_FILE" ] || return 0
+  line=$(/usr/bin/head -c 64 "$NUDGE_LAST_FILE" 2>/dev/null | /usr/bin/tr -d '\n')
+  NUDGE_OFF_REASON=${line%% *}
+  rest=${line#"$NUDGE_OFF_REASON"}
+  rest=${rest# }
+  case "$rest" in
+    ''|*[!0-9]*) NUDGE_OFF_EPOCH=0 ;;
+    *)           NUDGE_OFF_EPOCH=$rest ;;
+  esac
 }
 
 # --- writers -----------------------------------------------------------------
@@ -115,6 +181,12 @@ write_status() {
   "ac": $( [ "$AC" = 1 ] && echo true || echo false ),
   "battery": $BATT,
   "sleep_disabled": $sdflag,
+  "nudge_desired": "$NUDGE_DESIRED",
+  "nudge_active": $( [ "$NUDGE_REASON" = "ok" ] && echo true || echo false ),
+  "nudge_reason": "$NUDGE_REASON",
+  "nudge_expires_epoch": $NUDGE_EXPIRES,
+  "nudge_off_reason": "$NUDGE_OFF_REASON",
+  "nudge_off_epoch": $NUDGE_OFF_EPOCH,
   "updated": "$(/bin/date '+%Y-%m-%d %H:%M:%S')",
   "updated_epoch": $(/bin/date '+%s')
 }
@@ -122,6 +194,50 @@ EOF
   /bin/mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
   /bin/chmod 644 "$STATUS_FILE" 2>/dev/null
 }
+
+# --- decisions ---------------------------------------------------------------
+#
+# The two guard chains are split out from the loop and kept free of side
+# effects, so the test suite can drive the whole decision table with fake power
+# readings instead of needing a laptop it can unplug.
+
+# Reads DESIRED, AC, BATT. Sets REASON and WANT (the SleepDisabled value).
+decide_sleep_block() {
+  REASON="ok"; WANT=1
+  if [ "$DESIRED" != "on" ]; then
+    REASON="off"; WANT=0
+  elif [ "$AC" != "1" ]; then
+    REASON="no-ac"; WANT=0
+  elif [ "$BATT" -lt "$BATT_FLOOR" ]; then
+    REASON="battery-low"; WANT=0
+  elif ! thermal_ok_cached; then
+    REASON="thermal"; WANT=0
+  fi
+}
+
+# Reads NUDGE_DESIRED, NUDGE_EXPIRES, AC, BATT. Sets NUDGE_VERDICT to "off",
+# "ok", or the name of the guard that fired. Deciding and latching are separate
+# steps: this one only reports, the caller writes the file.
+decide_nudge() {
+  NUDGE_VERDICT="off"
+  [ "$NUDGE_DESIRED" = "on" ] || return 0
+  now_epoch=$(/bin/date '+%s')
+  if [ "$NUDGE_EXPIRES" -gt 0 ] && [ "$now_epoch" -ge "$NUDGE_EXPIRES" ]; then
+    NUDGE_VERDICT="expired"
+  elif [ "$AC" != "1" ]; then
+    NUDGE_VERDICT="no-ac"
+  elif [ "$BATT" -lt "$BATT_FLOOR" ]; then
+    NUDGE_VERDICT="battery-low"
+  elif ! thermal_ok_cached; then
+    NUDGE_VERDICT="thermal"
+  else
+    NUDGE_VERDICT="ok"
+  fi
+}
+
+# Sourcing this file defines the functions above without starting a daemon.
+# The test suite relies on this; nothing else sets it.
+[ "${KEEPAWAKE_LIB_ONLY:-0}" = "1" ] && return 0
 
 # --- lifecycle ---------------------------------------------------------------
 
@@ -131,6 +247,12 @@ cleanup() {
   apply 0
   log "daemon stopping; sleep re-enabled"
   AC=${AC:-0}; BATT=${BATT:-100}; DESIRED=${DESIRED:-off}
+  # A stopped daemon must not leave nudge_active true in the status file: the
+  # agent reads that field and would otherwise keep nudging with nothing left
+  # to enforce the guards.
+  NUDGE_DESIRED=${NUDGE_DESIRED:-off}; NUDGE_REASON="stopped"
+  NUDGE_EXPIRES=${NUDGE_EXPIRES:-0}
+  NUDGE_OFF_REASON=${NUDGE_OFF_REASON:-}; NUDGE_OFF_EPOCH=${NUDGE_OFF_EPOCH:-0}
   write_status false "stopped" 0
   exit 0
 }
@@ -138,27 +260,39 @@ trap cleanup EXIT INT TERM
 
 /bin/mkdir -p "$STATE_DIR" "$(/usr/bin/dirname "$LOG_FILE")"
 [ -f "$STATE_FILE" ] || printf 'off' >"$STATE_FILE"
+[ -f "$NUDGE_FILE" ] || printf 'off' >"$NUDGE_FILE"
 
 log "daemon started (interval=${INTERVAL}s batt_floor=${BATT_FLOOR}% therm_floor=${THERM_FLOOR}%)"
 
 last_reason=""
+last_nudge_reason=""
 last_flag=""
 prev_ac=""
 
 while :; do
+  THERM_CACHE=""
   DESIRED=$(read_desired)
   read_power
+  read_nudge
+  read_nudge_last
 
-  reason="ok"
-  want=1
-  if [ "$DESIRED" != "on" ]; then
-    reason="off"; want=0
-  elif [ "$AC" != "1" ]; then
-    reason="no-ac"; want=0
-  elif [ "$BATT" -lt "$BATT_FLOOR" ]; then
-    reason="battery-low"; want=0
-  elif ! thermal_ok; then
-    reason="thermal"; want=0
+  decide_sleep_block
+  reason="$REASON"
+  want="$WANT"
+
+  # Nudge mode runs the same guards, but latches off instead of holding off.
+  # Evaluated before the sleep block is applied so a single loop pass can both
+  # release the flag and end the nudge session on the same unplug event.
+  decide_nudge
+  case "$NUDGE_VERDICT" in
+    ok|off) NUDGE_REASON="$NUDGE_VERDICT" ;;
+    *)      nudge_latch_off "$NUDGE_VERDICT"
+            NUDGE_REASON="off"
+            read_nudge_last ;;
+  esac
+
+  if [ "$NUDGE_REASON" != "$last_nudge_reason" ]; then
+    log "nudge: desired=$NUDGE_DESIRED reason=$NUDGE_REASON expires=$NUDGE_EXPIRES"
   fi
 
   flag=$(read_sleep_disabled)
@@ -200,6 +334,7 @@ while :; do
   fi
 
   last_reason="$reason"
+  last_nudge_reason="$NUDGE_REASON"
   last_flag="$flag"
   prev_ac="$AC"
   /bin/sleep "$INTERVAL"

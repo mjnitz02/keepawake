@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.keepawake.nudge</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/libexec/keepawake-nudge-agent</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<!--
+	  No Standard{Out,Error}Path here on purpose. LaunchAgent plists do not
+	  expand ~, and this job runs as the logged-in user, who cannot create
+	  files in the root-owned log directory. The agent resolves $HOME itself
+	  and logs to ~/Library/Logs/keepawake-nudge.log.
+	-->
+</dict>
+</plist>

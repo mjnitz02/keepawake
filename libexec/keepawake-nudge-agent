@@ -1,0 +1,173 @@
+#!/bin/bash
+#
+# keepawake-nudge-agent
+#
+# The user-session half of nudge mode. Runs as a LaunchAgent in the Aqua
+# session, because synthesized input events have to originate inside the
+# logged-in GUI session. The root daemon cannot do this: it has no session to
+# post into, and it is the wrong thing to hold Accessibility permission.
+#
+# Division of labor:
+#   root daemon  decides WHETHER nudging is allowed (switch, AC, battery,
+#                thermal, expiry) and publishes nudge_active in status.json
+#   this agent   decides WHEN to actually nudge (only once the machine has
+#                genuinely gone idle) and does it
+#
+# So all the safety policy lives in one place, and this side stays dumb.
+
+set -u
+
+# Paths are overridable only so the test suite can substitute a scratch
+# directory and a stub helper. launchd controls the real agent's environment.
+STATE_DIR="${KEEPAWAKE_STATE_DIR:-/usr/local/var/keepawake}"
+STATUS_FILE="$STATE_DIR/status.json"
+CONF_FILE="$STATE_DIR/config"
+HELPER="${KEEPAWAKE_HELPER:-/usr/local/libexec/keepawake-nudge}"
+
+# Defaults, overridable from $CONF_FILE (shared with the root daemon).
+NUDGE_IDLE=300      # nudge once the machine has been idle this many seconds
+NUDGE_POLL=5        # seconds between checks
+LOG_MAX_BYTES=262144
+
+# shellcheck source=/dev/null
+[ -r "$CONF_FILE" ] && . "$CONF_FILE"
+
+LOG_FILE="$HOME/Library/Logs/keepawake-nudge.log"
+REPORT_DIR="$HOME/Library/Application Support/keepawake"
+REPORT_FILE="$REPORT_DIR/agent.json"
+
+/bin/mkdir -p "$(/usr/bin/dirname "$LOG_FILE")" "$REPORT_DIR" 2>/dev/null
+
+log() {
+  if [ -f "$LOG_FILE" ]; then
+    size=$(/usr/bin/stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$LOG_MAX_BYTES" ]; then
+      /bin/mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null
+    fi
+  fi
+  printf '%s  %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null
+}
+
+json_get() {
+  [ -r "$STATUS_FILE" ] || return 1
+  /usr/bin/sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" \
+    "$STATUS_FILE" | /usr/bin/head -1
+}
+
+# Written every poll so `keepawake status` can report what this side sees.
+#
+# Write to a temp file and rename, the same way the daemon publishes its status.
+# Truncating in place looks harmless for a 200-byte file, but `keepawake status`
+# reads this on a completely unrelated schedule, and catching it mid-write
+# yields a half-written report whose fields fail the numeric guards. The
+# symptom would be a perfectly healthy agent intermittently displayed as "not
+# running", which is exactly the kind of lie this report exists to prevent.
+write_report() {
+  /bin/cat >"$REPORT_FILE.tmp" 2>/dev/null <<EOF
+{
+  "running": true,
+  "trusted": $TRUSTED,
+  "idle": ${IDLE:-null},
+  "last_nudge_epoch": $LAST_NUDGE,
+  "nudges": $NUDGE_COUNT,
+  "helper": "$HELPER",
+  "uid": $(/usr/bin/id -u),
+  "updated_epoch": $(/bin/date '+%s')
+}
+EOF
+  /bin/mv -f "$REPORT_FILE.tmp" "$REPORT_FILE" 2>/dev/null
+}
+
+cleanup() {
+  trap - EXIT INT TERM
+  /bin/rm -f "$REPORT_FILE" "$REPORT_FILE.tmp" 2>/dev/null
+  log "agent stopping"
+  exit 0
+}
+trap cleanup EXIT INT TERM
+
+if [ ! -x "$HELPER" ]; then
+  log "FATAL helper missing at $HELPER; re-run sudo ./install.sh"
+  # Exit slowly. launchd KeepAlive would otherwise spin this in a tight loop.
+  /bin/sleep 60
+  exit 1
+fi
+
+TRUSTED=false
+IDLE=""
+LAST_NUDGE=0
+NUDGE_COUNT=0
+prev_active=""
+warned_untrusted=0
+prompted=0
+
+# Ask the helper directly rather than trusting a cached answer. Run from here,
+# the answer describes the agent's own TCC identity, which is the one that
+# matters. The same question asked from a terminal would describe the terminal.
+refresh_trust() {
+  if "$HELPER" check >/dev/null 2>&1; then TRUSTED=true; else TRUSTED=false; fi
+}
+
+refresh_trust
+log "agent started (nudge_idle=${NUDGE_IDLE}s poll=${NUDGE_POLL}s accessibility=$TRUSTED)"
+
+while :; do
+  active=$(json_get nudge_active 2>/dev/null)
+
+  if [ "$active" = "true" ]; then
+    if [ "$prev_active" != "true" ]; then
+      refresh_trust
+      log "nudge ACTIVE (accessibility=$TRUSTED, idling above ${NUDGE_IDLE}s will nudge)"
+      # First activation with no permission is the moment to ask for it. macOS
+      # only shows this dialog once per binary, and asking from here attributes
+      # it to the helper rather than to whatever terminal ran the CLI.
+      if [ "$TRUSTED" != "true" ] && [ "$prompted" = "0" ]; then
+        "$HELPER" check --prompt >/dev/null 2>&1
+        prompted=1
+        log "requested Accessibility permission for $HELPER"
+      fi
+    fi
+
+    IDLE=$("$HELPER" idle 2>/dev/null)
+    case "$IDLE" in
+      ''|*[!0-9]*) IDLE="" ;;
+    esac
+
+    if [ -n "$IDLE" ] && [ "$IDLE" -ge "$NUDGE_IDLE" ]; then
+      after=$("$HELPER" nudge 2>/dev/null)
+      case "$after" in
+        ''|*[!0-9]*) after=999 ;;
+      esac
+
+      if [ "$after" -lt 5 ]; then
+        # Idle collapsed, so the event really landed.
+        LAST_NUDGE=$(/bin/date '+%s')
+        NUDGE_COUNT=$((NUDGE_COUNT + 1))
+        IDLE=$after
+        TRUSTED=true
+        warned_untrusted=0
+        log "nudged after ${NUDGE_IDLE}s idle (idle now ${after}s, total $NUDGE_COUNT)"
+      else
+        # The post silently did nothing. That is what a missing Accessibility
+        # grant looks like from here: no error, no event, idle unchanged.
+        TRUSTED=false
+        if [ "$warned_untrusted" = "0" ]; then
+          refresh_trust
+          log "NUDGE HAD NO EFFECT (idle still ${after}s). Grant Accessibility to $HELPER:"
+          log "  System Settings > Privacy & Security > Accessibility > +"
+          log "  then Cmd+Shift+G and paste: $HELPER"
+          warned_untrusted=1
+        fi
+      fi
+    fi
+  else
+    if [ "$prev_active" = "true" ]; then
+      log "nudge inactive (daemon released it); $NUDGE_COUNT nudges this session"
+    fi
+    IDLE=""
+  fi
+
+  write_report
+  prev_active="$active"
+  /bin/sleep "$NUDGE_POLL"
+done
