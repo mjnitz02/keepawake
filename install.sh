@@ -151,13 +151,40 @@ if is_number "$SS_IDLE" && is_number "$NUDGE_IDLE_CFG"; then
 fi
 
 # --- 4. launchd daemon -------------------------------------------------------
+# `launchctl bootout` returns once the request is accepted, not once the job is
+# gone: the label stays registered until the daemon process actually exits.
+# Bootstrapping the same label inside that window fails with the singularly
+# unhelpful "Bootstrap failed: 5: Input/output error", so wait for the old job
+# to really disappear instead of guessing at a fixed delay.
+wait_for_bootout() {
+  i=0
+  while [ "$i" -lt 30 ]; do
+    /bin/launchctl print "$1" >/dev/null 2>&1 || return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 if /bin/launchctl print "system/$LABEL" >/dev/null 2>&1; then
   /bin/launchctl bootout "system/$LABEL" 2>/dev/null || true
-  sleep 1
+  wait_for_bootout "system/$LABEL" \
+    || say "WARNING: the old $LABEL job is still unloading after 30s"
 fi
 /usr/bin/install -o root -g wheel -m 644 "$SRC/launchd/$LABEL.plist" "$PLIST"
-/bin/launchctl bootstrap system "$PLIST"
-say "loaded launchd daemon $LABEL"
+
+# A failed bootstrap must not abort the installer under `set -e`. It would leave
+# a half install: binaries and config in place, but the nudge agent below never
+# written, which is harder to recover from than the original failure.
+if /bin/launchctl bootstrap system "$PLIST" 2>/dev/null; then
+  say "loaded launchd daemon $LABEL"
+elif sleep 3 && /bin/launchctl bootstrap system "$PLIST" 2>/dev/null; then
+  say "loaded launchd daemon $LABEL (on retry)"
+else
+  say "WARNING: could not bootstrap $LABEL"
+  say "         inspect:  sudo launchctl print system/$LABEL"
+  say "         retry:    sudo launchctl bootstrap system $PLIST"
+fi
 
 # --- 4b. nudge LaunchAgent ---------------------------------------------------
 /bin/mkdir -p /Library/LaunchAgents
@@ -165,6 +192,7 @@ say "loaded launchd daemon $LABEL"
 
 if [ "${GUI_UID:-0}" != "0" ]; then
   /bin/launchctl bootout "gui/$GUI_UID/$NUDGE_LABEL" 2>/dev/null || true
+  wait_for_bootout "gui/$GUI_UID/$NUDGE_LABEL" || true
   if /bin/launchctl bootstrap "gui/$GUI_UID" "$AGENT_PLIST" 2>/dev/null; then
     say "loaded launch agent $NUDGE_LABEL in gui/$GUI_UID"
   else

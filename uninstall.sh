@@ -18,9 +18,15 @@ GUI_UID="$(/usr/bin/stat -f%u /dev/console 2>/dev/null || echo 0)"
 echo "==> Removing keepawake"
 
 # Booting the daemon out makes it restore SleepDisabled=0 on its way down,
-# but set it explicitly too in case the daemon already died.
+# but set it explicitly too in case the daemon already died. Wait for the job to
+# actually go: bootout only submits the request, and removing the state dir out
+# from under a still-running daemon leaves it recreating files as it exits.
 /bin/launchctl bootout "system/$LABEL" 2>/dev/null || true
-sleep 1
+i=0
+while [ "$i" -lt 30 ] && /bin/launchctl print "system/$LABEL" >/dev/null 2>&1; do
+  sleep 1
+  i=$((i + 1))
+done
 /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1
 echo "  sleep re-enabled (SleepDisabled=$(/usr/bin/pmset -g | /usr/bin/awk '/SleepDisabled/{print $2; exit}'))"
 

@@ -241,9 +241,25 @@ decide_nudge() {
 
 # --- lifecycle ---------------------------------------------------------------
 
+# bash defers a trapped signal until the running foreground command finishes, so
+# a plain `sleep $INTERVAL` between passes would make SIGTERM take up to INTERVAL
+# seconds to be noticed. That matters beyond tidiness: launchd keeps the label
+# registered until this process exits, and an installer or `launchctl kickstart`
+# that re-bootstraps in the meantime fails with "Bootstrap failed: 5". A
+# backgrounded sleep that we `wait` on is interruptible, so the trap fires at
+# once and teardown no longer depends on the poll interval.
+NAP_PID=""
+nap() {
+  /bin/sleep "$1" &
+  NAP_PID=$!
+  wait "$NAP_PID" 2>/dev/null || true
+  NAP_PID=""
+}
+
 # Always hand sleep back to macOS when we stop, however we stop.
 cleanup() {
   trap - EXIT INT TERM
+  [ -n "$NAP_PID" ] && /bin/kill "$NAP_PID" 2>/dev/null
   apply 0
   log "daemon stopping; sleep re-enabled"
   AC=${AC:-0}; BATT=${BATT:-100}; DESIRED=${DESIRED:-off}
@@ -337,5 +353,5 @@ while :; do
   last_nudge_reason="$NUDGE_REASON"
   last_flag="$flag"
   prev_ac="$AC"
-  /bin/sleep "$INTERVAL"
+  nap "$INTERVAL"
 done

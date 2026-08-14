@@ -155,6 +155,36 @@ stop_agent
   || ok "a clean stop removes the report"
 
 # ---------------------------------------------------------------------------
+suite "stops the moment launchd asks it to"
+
+# The regression this guards is easy to reintroduce and invisible without a
+# test. bash holds a trapped signal until the running foreground command
+# finishes, so an agent sitting in a plain `sleep $NUDGE_POLL` ignores SIGTERM
+# for up to a full poll. launchd keeps the label registered until the process
+# exits, so an installer that boots the job out and immediately re-bootstraps it
+# fails with "Bootstrap failed: 5: Input/output error". A deliberately long poll
+# makes the difference unmissable: 30 seconds versus a fraction of one.
+cat >"$KEEPAWAKE_STATE_DIR/config" <<'EOF'
+NUDGE_IDLE=300
+NUDGE_POLL=30
+EOF
+
+echo 0 >"$IDLE_FILE"; echo 1 >"$WORKS_FILE"; set_active false
+if start_agent; then
+  sleep 1   # let it finish a pass and settle into the long sleep
+  kill "$AGENT_PID" 2>/dev/null
+  GONE=0
+  for _ in $(seq 1 50); do   # 5s ceiling, far below the 30s poll
+    kill -0 "$AGENT_PID" 2>/dev/null || { GONE=1; break; }
+    sleep 0.1
+  done
+  wait "$AGENT_PID" 2>/dev/null
+  assert_eq "1" "$GONE" "SIGTERM mid-poll exits without waiting out the interval"
+  assert_contains "$(cat "$LOG" 2>/dev/null || true)" "agent stopping" \
+    "and the cleanup trap still runs"
+fi
+
+# ---------------------------------------------------------------------------
 suite "survives a missing helper"
 
 export KEEPAWAKE_HELPER="$D/does-not-exist"

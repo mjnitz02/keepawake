@@ -78,8 +78,22 @@ EOF
   /bin/mv -f "$REPORT_FILE.tmp" "$REPORT_FILE" 2>/dev/null
 }
 
+# Interruptible sleep. bash holds a trapped signal until the running foreground
+# command finishes, so a plain `sleep` here would leave the agent ignoring
+# SIGTERM for up to a full poll interval (or a full minute on the error path
+# below). launchd keeps the label registered until this process exits, so a
+# reinstall or `launchctl kickstart` in that window fails to bootstrap.
+NAP_PID=""
+nap() {
+  /bin/sleep "$1" &
+  NAP_PID=$!
+  wait "$NAP_PID" 2>/dev/null || true
+  NAP_PID=""
+}
+
 cleanup() {
   trap - EXIT INT TERM
+  [ -n "$NAP_PID" ] && /bin/kill "$NAP_PID" 2>/dev/null
   /bin/rm -f "$REPORT_FILE" "$REPORT_FILE.tmp" 2>/dev/null
   log "agent stopping"
   exit 0
@@ -89,7 +103,7 @@ trap cleanup EXIT INT TERM
 if [ ! -x "$HELPER" ]; then
   log "FATAL helper missing at $HELPER; re-run sudo ./install.sh"
   # Exit slowly. launchd KeepAlive would otherwise spin this in a tight loop.
-  /bin/sleep 60
+  nap 60
   exit 1
 fi
 
@@ -169,5 +183,5 @@ while :; do
 
   write_report
   prev_active="$active"
-  /bin/sleep "$NUDGE_POLL"
+  nap "$NUDGE_POLL"
 done
