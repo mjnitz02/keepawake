@@ -1,0 +1,61 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Must be macOS. The helper links ApplicationServices, and the scripts use
+    # pmset, ioreg, and BSD stat, none of which exist on a Linux runner.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          for f in bin/keepawake libexec/keepawake-daemon \
+                   libexec/keepawake-nudge-agent install.sh uninstall.sh \
+                   tests/*.sh; do
+            bash -n "$f" || exit 1
+            echo "ok  $f"
+          done
+
+      - name: Plist syntax
+        run: |
+          for p in launchd/*.plist; do plutil -lint "$p" || exit 1; done
+
+      - name: Executable bits
+        # A missing +x makes the installer produce a broken install, and it is
+        # the kind of thing a rebase quietly drops.
+        run: |
+          rc=0
+          for f in bin/keepawake libexec/keepawake-daemon \
+                   libexec/keepawake-nudge-agent install.sh uninstall.sh \
+                   tests/run.sh; do
+            if [ ! -x "$f" ]; then echo "not executable: $f"; rc=1; fi
+          done
+          exit $rc
+
+      - name: Run tests
+        run: tests/run.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint
+        # SC1090/SC1091: the config file is sourced from a runtime path.
+        # SC2317: functions defined for the test suite to source look unreachable.
+        run: |
+          shellcheck --severity=warning -e SC1090,SC1091,SC2317 \
+            bin/keepawake \
+            libexec/keepawake-daemon \
+            libexec/keepawake-nudge-agent \
+            install.sh uninstall.sh tests/*.sh

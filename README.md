@@ -65,6 +65,132 @@ trigger this, since that is someone still using the machine.
 
 The net effect: unplug, close, go. No command required, in either order.
 
+## Nudge mode: keeping the screen saver away
+
+A second, separate problem. Blocking sleep does not stop the screen saver, and
+on a managed Mac the screen saver is the thing that ends a remote session: it
+starts, the display locks or the session goes inactive, and the VPN and any
+remote shells go with it.
+
+This matters for one specific use: leaving the Mac at home running remote work
+(Claude Code sessions, a PagerDuty watch) while you are out for the evening. The
+laptop stays home, which is both safer and less to carry, but only if it is
+still reachable at 11pm.
+
+### Why caffeinate cannot do this
+
+`caffeinate -d`, `-i`, `-m`, `-s`, `-u`, and every combination of them create
+IOKit power assertions. Assertions move the **sleep** timers. The screen saver
+runs off a different clock entirely: **HID idle time**, which only real input
+events reset.
+
+The two clocks are usually nowhere near each other. On this machine:
+
+```
+screen saver idleTime  1200   (20 min, enforced by Jamf)
+displaysleep             60   (60 min)
+```
+
+The screen saver fires forty minutes before display sleep is even a question,
+so an assertion that blocks display sleep blocks a timer that never gets
+reached. This is also why Amphetamine ships a mouse-movement feature at all: it
+only sets `PreventUserIdleSystemSleep` and `PreventUserIdleDisplaySleep`, and
+those were never going to be enough on their own.
+
+The only thing that resets the HID clock is an actual input event. So nudge
+mode synthesizes one: it moves the cursor one pixel and immediately moves it
+back, once the Mac has genuinely gone idle.
+
+### Use
+
+```sh
+keepawake nudge on 7h     # nudge for the next 7 hours
+keepawake nudge on        # same, with the default duration (8h)
+keepawake nudge on forever
+keepawake nudge off
+keepawake nudge status
+keepawake nudge log
+```
+
+It never turns itself on. There is no schedule, no automatic enablement, and
+nothing about plugging in a power cable starts it. Most weeks it is not useful,
+so it stays off until you ask for it.
+
+### How it turns itself off
+
+Nudge mode **latches off**. This is the one place it deliberately differs from
+the sleep block:
+
+| | sleep block | nudge |
+| --- | --- | --- |
+| unplug AC | held off, resumes on replug | **switched off, stays off** |
+| turning it back on | automatic | manual only |
+
+The sleep block is a standing preference, so resuming it on replug is right.
+Nudging is something you switched on for one evening. A machine that starts
+moving its own cursor again because it found a power outlet in a coffee shop
+would be wrong, so any guard that fires ends the session for good.
+
+It switches off on all of:
+
+- **AC power disconnected**, the main one
+- **battery below `BATT_FLOOR`**
+- **CPU thermally throttled**
+- **the duration expiring**
+
+`keepawake status` shows which one fired and how long ago:
+
+```
+  nudge      off (auto-off: no-ac, 12m ago)
+```
+
+### It only nudges an idle machine
+
+The agent nudges once HID idle passes `NUDGE_IDLE` (default 300s). If you are
+sitting at the machine, idle never gets there and nothing touches your cursor.
+`NUDGE_IDLE` has to stay comfortably below the screen saver's idle time; the
+installer checks yours and warns if it does not.
+
+### The permission, and the failure it causes
+
+Posting an input event requires **Accessibility**, granted per binary. Grant it
+to:
+
+```
+/usr/local/libexec/keepawake-nudge
+```
+
+via `keepawake nudge grant`, or System Settings > Privacy & Security >
+Accessibility > `+`, then Cmd+Shift+G and paste the path.
+
+This is worth doing carefully, because without the grant macOS **accepts the
+event and silently discards it**. No error, no failed call, nothing in a log.
+The switch reads `on` all evening while the screen saver starts exactly on
+schedule.
+
+So the agent does not trust the API. After each nudge it re-reads the idle
+clock and checks it actually dropped, and reports that outcome:
+
+```
+  nudge      on · idle 5m · nudged 3m ago (7) · 5h58m left
+  agent      running · Accessibility granted
+```
+
+```
+  agent      Accessibility not granted · nudges will silently do nothing
+```
+
+Reinstalling only rebuilds the helper when its source changed, because macOS
+ties the grant to the binary's hash and a needless rebuild would revoke it.
+
+### Why a second process
+
+The nudge agent runs as a LaunchAgent in your GUI session, not in the root
+daemon. Synthesized input has to originate inside the logged-in session, and
+root is the wrong thing to hold Accessibility. The daemon still owns every
+policy decision and publishes `nudge_active`; the agent only decides when the
+machine is idle enough to act.
+
 ## Install
 
 ```sh
@@ -72,7 +198,7 @@ sudo ./install.sh
 ```
 
 The installer verifies that the kernel actually accepts the flag, and tells you
-if something refuses it.
+if something refuses it. It also compiles the nudge helper and loads the agent.
 
 ## Use
 
@@ -122,6 +248,13 @@ you're fighting clamshell sleep, idle sleep, or something else entirely.
 | `/usr/local/var/keepawake/state` | `on` / `off`, admin-writable |
 | `/usr/local/var/keepawake/config` | interval and guard thresholds |
 | `/usr/local/var/keepawake/status.json` | what the daemon is doing, read by `status` |
+| `/usr/local/var/keepawake/nudge` | nudge switch, `off` or `on <expiry>`, admin-writable |
+| `/usr/local/var/keepawake/nudge.last` | what turned nudge off last, and when |
+| `/usr/local/libexec/keepawake-nudge` | the compiled cursor helper, holds Accessibility |
+| `/usr/local/libexec/keepawake-nudge-agent` | the user-session agent loop |
+| `/Library/LaunchAgents/local.keepawake.nudge.plist` | launchd agent |
+| `~/Library/Logs/keepawake-nudge.log` | nudge agent log |
+| `~/Library/Application Support/keepawake/agent.json` | what the agent sees, read by `status` |
 | `/usr/local/var/log/keepawake.log` | daemon log |
 
 The state file is `root:admin` mode 664 so `keepawake on|off` works without sudo.
@@ -143,6 +276,38 @@ Edit `/usr/local/var/keepawake/config`, then:
 ```sh
 sudo launchctl kickstart -k system/local.keepawake
 ```
+
+## Tests
+
+```sh
+tests/run.sh              # everything
+tests/run.sh daemon cli   # just those suites
+```
+
+No root, no install, no changes to the machine's power settings. Every suite
+runs in a scratch directory. GitHub Actions runs them on `macos-latest` for
+every PR, plus shellcheck.
+
+What is covered: both guard decision tables in full, the state file parsers, the
+latch-off behavior, duration parsing, and every state the status display can
+render. The agent is driven by a stub helper that can pretend to be an
+unauthorized binary, so the silent-discard failure is regression-tested rather
+than discovered at 9pm.
+
+What is not, because it needs root and real hardware:
+
+- whether `pmset` actually flips `SleepDisabled`. `install.sh` verifies this
+  at install time instead, and says so if something refuses.
+- whether a synthesized event reaches the window server. That needs a real
+  Accessibility grant, so the agent verifies it at runtime by checking the idle
+  clock actually moved.
+- launchd bootstrap, and behavior on a real unplug.
+
+Two things worth knowing if you add tests. The daemon and CLI can be sourced
+without running, by setting `KEEPAWAKE_LIB_ONLY=1`, which is how the decision
+tables get tested directly. And `KEEPAWAKE_STATE_DIR`, `KEEPAWAKE_LOG_FILE`,
+and `KEEPAWAKE_HELPER` redirect the hardcoded paths; they exist for the tests,
+and launchd controls the real processes' environment.
 
 ## Notes
 
