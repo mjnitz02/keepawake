@@ -1,0 +1,31 @@
+# Dependabot version updates.
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# This repo has no package manager: it's shell scripts plus one C file that
+# links a macOS system framework. The only thing with versions to track is the
+# set of actions in .github/workflows, so there is a single ecosystem here and
+# no need for a multi-ecosystem group.
+
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Nobody reviews these PRs before they merge, so wait a week after a
+    # release: time for a compromised or broken version to be yanked upstream.
+    # Security updates ignore the cooldown.
+    cooldown:
+      default-days: 7
+    groups:
+      # One PR a week for all of them rather than one per action — codeql-action's
+      # init and analyze would otherwise open a matched pair every time.
+      # dependabot-automerge.yml merges it once the required checks pass.
+      actions:
+        patterns: ["*"]
+      # Security updates can't share a group with version updates, so they get
+      # their own. Without this they arrive one PR per vulnerable action.
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
