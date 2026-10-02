@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Local builds of the nudge helper. install.sh compiles it to a temp path and
+# installs to /usr/local/libexec, but a hand-run `cc` lands here.
+keepawake-nudge
+*.o
+*.dSYM/
+
+# Scratch output from running the test suite outside its own temp dir.
+tests/tmp/

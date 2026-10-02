@@ -1,0 +1,89 @@
+name: CodeQL
+
+# Two jobs, split by what CodeQL needs to see the code.
+#
+# `actions` analyzes the workflow files themselves without a build, so it runs
+# on a cheap Linux runner. `c-cpp` has to compile src/keepawake-nudge.c, which
+# links the ApplicationServices framework — that only exists on macOS, so it
+# needs a macOS runner and a manual build.
+#
+# Nothing here covers the shell scripts: CodeQL has no shell support. That gap
+# is filled by shellcheck in test.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays, 11:17 UTC. Offset from the other repos so the weekly runs don't
+    # all queue at once, and off the hour so it isn't competing with everyone
+    # else's top-of-hour cron jobs. The schedule matters even with PR runs: it
+    # re-analyzes existing code against newly published queries.
+    - cron: '17 11 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-actions:
+    name: Analyze actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Uploading results to the Security tab needs write here; everything
+      # else stays read-only.
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        with:
+          languages: actions
+          build-mode: none
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        with:
+          category: /language:actions
+
+  analyze-c:
+    name: Analyze c-cpp
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # build-mode: manual, not autobuild. There is no build system here — no
+      # Makefile, no Xcode project — so autobuild has nothing to find. The one
+      # command below is the same one install.sh runs.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      - name: Build the nudge helper
+        # Keep these flags in step with the cc invocation in install.sh:
+        # CodeQL only analyzes what this command actually compiles.
+        run: |
+          cc -O2 -Wall -o "$RUNNER_TEMP/keepawake-nudge" \
+            src/keepawake-nudge.c -framework ApplicationServices
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        with:
+          category: /language:c-cpp

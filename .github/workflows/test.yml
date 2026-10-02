@@ -8,13 +8,21 @@ on:
 permissions:
   contents: read
 
+# Cancel an in-progress run when a newer commit lands on the same branch/PR.
+# head_ref (PR source branch) falls back to ref (push), so push + PR runs for
+# one branch share a group instead of running twice.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    name: Tests
     # Must be macOS. The helper links ApplicationServices, and the scripts use
     # pmset, ioreg, and BSD stat, none of which exist on a Linux runner.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Shell syntax
         run: |
@@ -45,9 +53,10 @@ jobs:
         run: tests/run.sh
 
   shellcheck:
+    name: Shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint

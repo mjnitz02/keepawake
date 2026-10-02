@@ -1,0 +1,9 @@
+# Normalize line endings on checkin; check out with LF everywhere. A CRLF in
+# any of these files is not cosmetic: a shell script with CRLF line endings
+# fails with "bad interpreter", and launchd rejects the plists.
+* text=auto eol=lf
+
+# Binary assets — never diff, never eol-convert.
+*.png  binary
+*.jpg  binary
+*.pdf  binary
