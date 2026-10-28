@@ -45,13 +45,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           languages: actions
           build-mode: none
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           category: /language:actions
 
@@ -71,7 +71,7 @@ jobs:
       # Makefile, no Xcode project — so autobuild has nothing to find. The one
       # command below is the same one install.sh runs.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           languages: c-cpp
           build-mode: manual
@@ -84,6 +84,6 @@ jobs:
             src/keepawake-nudge.c -framework ApplicationServices
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           category: /language:c-cpp
